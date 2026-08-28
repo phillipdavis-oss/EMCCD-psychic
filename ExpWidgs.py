@@ -23,6 +23,11 @@ import logging
 
 log = logging.getLogger("EMCCD")
 
+# Floor on the progress-bar tick interval. 100 ticks across a 0.5s exposure
+# would be a 5ms cross-thread QTimer, which is what used to make short
+# exposures misbehave badly enough that the bar was skipped outright.
+PROGRESS_MIN_INTERVAL_MS = 20
+
 
 seriesTags = {"SLITS": "slits",
               "SPECL": "center_lambda",
@@ -445,26 +450,54 @@ class BaseExpWidget(QtWidgets.QWidget):
         self.runSettings["progress"] = 0
         self.runSettings["reading"] = False
 
-        if not self.papa.ui.mFileTakeContinuous.isChecked():
+        # Three very different things can dominate the wall time between here
+        # and the acquisition event -- arming the camera, waiting on the FEL,
+        # and the exposure+readout itself -- so time them separately. A single
+        # "it took 15s" line can't tell them apart.
+        verbose = not self.papa.ui.mFileTakeContinuous.isChecked()
+        if verbose:
             # don't spam the log
             log.debug("Beginning an exposure")
-        self.papa.CCD.dllStartAcquisition()
+            log.debug("Camera: {}".format(self.papa.CCD.describeSettings()))
+            timings = self.papa.CCD.getAcquisitionTimings()
+            if timings is not None:
+                log.debug("Camera timings (s): exposure={:.4f}, "
+                          "accumulate={:.4f}, kinetic={:.4f}".format(*timings))
+            readout = self.papa.CCD.getReadoutTime()
+            if readout is not None:
+                log.debug("Camera readout time: {:.4f}s (keep clean {})".format(
+                    readout, self.papa.CCD.getKeepCleanTime()))
+
+        tStart = time.perf_counter()
+        ret = self.papa.CCD.dllStartAcquisition()
+        if verbose:
+            log.debug("StartAcquisition returned {} after {:.3f}s".format(
+                self.papa.CCD.parseRetCode(ret), time.perf_counter() - tStart))
         if self.hasFEL and not self.papa.oscWidget.settings["isScopePaused"] and not self.papa.ui.mFileTakeContinuous.isChecked():
             # Wait for an FEL pulse before we start counting, as determined by
             # the oscilloscope triggering.
             #
             # This feature is intended to synchronize better with the camera
             # exposure when it is also triggered by the FEL.
+            log.debug("Waiting on the scope for an FEL pulse")
+            tPulse = time.perf_counter()
             waitForPulseLoop = QtCore.QEventLoop()
             self.papa.oscWidget.sigOscDataCollected.connect(waitForPulseLoop.exit)
             waitForPulseLoop.exec_()
+            log.debug("Waited {:.3f}s for an FEL pulse".format(
+                time.perf_counter() - tPulse))
 
         self.runSettings["exposing"] = True
 
         if not self.papa.ui.mFileTakeContinuous.isChecked():
             self.sigStartTimer.emit()
+        tWait = time.perf_counter()
         ret = self.papa.CCD.dllWaitForAcquisition()
-        log.debug("Finished Waiting for Acquisition")
+        log.debug("Finished Waiting for Acquisition: {} after {:.3f}s "
+                  "({:.3f}s since StartAcquisition)".format(
+                      self.papa.CCD.parseRetCode(ret),
+                      time.perf_counter() - tWait,
+                      time.perf_counter() - tStart))
         self.runSettings["exposing"] = False
         if self.hasFEL:
             self.papa.oscWidget.stopExposure()
@@ -502,13 +535,15 @@ class BaseExpWidget(QtWidgets.QWidget):
         log.debug("Abort acq return val: {}".format(ret))
 
     def startProgressBar(self):
-        # things are breaking if the exposure time is too short
-        # I'm pretty sure it's because I didn't do things intelligently,
-        # but I think this is an edge case which doesn't have to work,
-        # but certainly shouldn't crash the software like it does
-        if self.papa.CCD.cameraSettings["exposureTime"]<=1:
-            return
-
+        # A short exposure used to skip the progress bar entirely, on the
+        # grounds that it "doesn't have to work". But a 0.5s exposure is
+        # exactly where the bar matters most: the exposure is a rounding
+        # error next to the readout, so the operator would otherwise stare
+        # at a frozen window for the whole acquisition. Rather than bail
+        # out, floor the tick interval (PROGRESS_MIN_INTERVAL_MS) so we
+        # don't ask Qt for a 5ms cross-thread timer, and let
+        # updateProgressBar drive the bar off the clock instead of off the
+        # tick count.
         self.runSettings["reading"] = False
         self.runSettings["phaseDurationMs"] = self.papa.CCD.cameraSettings["exposureTime"]*1000
 
@@ -516,7 +551,8 @@ class BaseExpWidget(QtWidgets.QWidget):
         self.exposureElapsedTimer.start()
 
         self.progressTimer.timeout.connect(self.updateProgressBar)
-        self.progressTimer.setInterval(self.runSettings["phaseDurationMs"]/100)
+        self.progressTimer.setInterval(max(
+            self.runSettings["phaseDurationMs"]/100, PROGRESS_MIN_INTERVAL_MS))
         self.progressTimer.setSingleShot(True)
         self.progressTimer.start()
 
@@ -548,19 +584,30 @@ class BaseExpWidget(QtWidgets.QWidget):
             self.papa.updateElementSig.emit(self.ui.lCCDProg, "Reading Data")
             self.ui.pCCD.setValue(self.runSettings["progress"])
             return
+        if self.exposureElapsedTimer is None:
+            # A previous tick already gave up (no readout estimate available)
+            # and dropped the timer. Nothing left to drive the bar with.
+            return
         if self.runSettings["progress"] < 100:
+            duration = self.runSettings["phaseDurationMs"]
+            elapsed = self.exposureElapsedTimer.elapsed()
 
-            self.runSettings["progress"] += 1
+            # Read the percentage off the clock rather than incrementing it
+            # once per tick. The interval is floored, so a short phase gets
+            # fewer than 100 ticks, and a += 1 would leave the bar crawling
+            # along at a fraction of the real progress.
+            self.runSettings["progress"] = min(
+                int(100 * elapsed / duration), 100) if duration else 100
             self.ui.pCCD.setValue(self.runSettings["progress"])
             # Get the new time, correcting for lags and other things
             # which deviate from expected.
-            newTime = ((self.runSettings["progress"] + 1) * self.runSettings["phaseDurationMs"]/100) \
-                      - (self.exposureElapsedTimer.elapsed())
+            newTime = ((self.runSettings["progress"] + 1) * duration/100) \
+                      - elapsed
 
             # Sometimes things take so long, it wants us to go back in time,
             # which we can't yet do.
-            if newTime < 0:
-                newTime = 0
+            if newTime < PROGRESS_MIN_INTERVAL_MS:
+                newTime = PROGRESS_MIN_INTERVAL_MS
 
             try:
                 self.progressTimer.setInterval(newTime)
@@ -585,7 +632,9 @@ class BaseExpWidget(QtWidgets.QWidget):
                 self.papa.updateElementSig.emit(
                     self.ui.lCCDProg, "Reading Data (~{:.1f}s)".format(estimate))
                 self.ui.pCCD.setValue(0)
-                self.progressTimer.setInterval(self.runSettings["phaseDurationMs"]/100)
+                self.progressTimer.setInterval(max(
+                    self.runSettings["phaseDurationMs"]/100,
+                    PROGRESS_MIN_INTERVAL_MS))
                 self.progressTimer.timeout.connect(self.updateProgressBar)
                 self.progressTimer.start()
             else:

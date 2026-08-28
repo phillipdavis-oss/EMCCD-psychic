@@ -353,19 +353,96 @@ class AndorEMCCD(object):
         #     print x,y
         return x, y
 
+    def getAcquisitionTimings(self):
+        """
+        :return: (exposure, accumulate, kinetic) in seconds, as the camera
+        actually quantized them, or None if the call isn't available or fails.
+
+        Worth logging before every acquisition: cameraSettings['exposureTime']
+        is only what we *asked* for. If the kinetic time comes back at 15s for
+        a 0.5s exposure, the camera is spending that time reading out (or
+        accumulating) and nothing outside this program can fix it. If it comes
+        back at ~0.5s and the acquisition still takes 15s, the camera is
+        sitting on the external trigger instead.
+        """
+        if self.dllGetAcquisitionTimings is None:
+            return None
+        exposure, accumulate, kinetic = c_float(0), c_float(0), c_float(0)
+        ret = self.dllGetAcquisitionTimings(exposure, accumulate, kinetic)
+        if ret != 20002:
+            log.debug("GetAcquisitionTimings failed: {}".format(
+                self.parseRetCode(ret)))
+            return None
+        return exposure.value, accumulate.value, kinetic.value
+
+    def getReadoutTime(self):
+        """
+        :return: the camera's own readout time in seconds, or None on a
+        pre-2.9 SDK (or if the call fails).
+        """
+        return self._getSingleTiming(self.dllGetReadOutTime, "GetReadOutTime")
+
+    def getKeepCleanTime(self):
+        """
+        :return: the camera's keep-clean time in seconds, or None on a
+        pre-2.9 SDK (or if the call fails).
+        """
+        return self._getSingleTiming(self.dllGetKeepCleanTime,
+                                     "GetKeepCleanTime")
+
+    def _getSingleTiming(self, func, name):
+        if func is None:
+            return None
+        val = c_float(0)
+        ret = func(val)
+        if ret != 20002:
+            log.debug("{} failed: {}".format(name, self.parseRetCode(ret)))
+            return None
+        return val.value
+
+    def describeSettings(self):
+        """
+        :return: one line naming everything that governs how long an
+        acquisition takes. Logged at the start of an exposure so the log
+        alone is enough to tell a slow readout from a slow trigger.
+        """
+        return ("read={curReadMode} trig={curTrig} acq={curAcqMode} "
+                "AD={curADChannel} amp={outputAmp} HSS={curHSS} VSS={curVSS} "
+                "image={imageSettings} exp={exposureTime} gain={gain}".format(
+                    **self.cameraSettings))
+
     def estimateReadoutTime(self):
         """
-        :return: rough estimate, in seconds, of how long the camera will
-        spend reading out a frame at the currently configured HSS/VSS
-        speeds (both stored in cameraSettings as microseconds), or None
-        if those speeds aren't known yet (e.g. fake camera, not yet set).
+        :return: how long, in seconds, the camera will spend reading out a
+        frame with the current settings, or None if it can't be determined.
+
+        Prefers the camera's own answer (GetReadOutTime, else the kinetic
+        cycle time from GetAcquisitionTimings minus the exposure), falling
+        back to arithmetic only when neither call exists.
+
+        That fallback is deliberately asymmetric. GetVSSpeed reports
+        microseconds per row shift, but GetHSSpeed reports MHz on the
+        iXon/Newton (see the docstring on its binding), so the horizontal
+        term is pixels/rate, not pixels*rate. Having those units the same
+        way round is what made this function claim 0.03s for a full-frame
+        readout that really takes ~13s at the 0.05MHz conventional speed.
         """
+        readout = self.getReadoutTime()
+        if readout is not None:
+            return readout
+
+        timings = self.getAcquisitionTimings()
+        if timings is not None:
+            exposure, _, kinetic = timings
+            if kinetic > exposure:
+                return kinetic - exposure
+
         hss = self.cameraSettings['curHSS']
         vss = self.cameraSettings['curVSS']
-        if hss is None or vss is None:
+        if not hss or vss is None:
             return None
         x, y = self._getImageDims()
-        return (y * vss + x * y * hss) / 1e6
+        return y * vss / 1e6 + x * y / (hss * 1e6)
 
     def getImage(self):
         """
@@ -996,6 +1073,49 @@ class AndorEMCCD(object):
         self.dllSetExposureTime = dll.SetExposureTime
         self.dllSetExposureTime.restype = c_uint
         self.dllSetExposureTime.argtypes = [c_float]
+
+        """
+        GetAcquisitionTimings: This function will return the current "valid"
+        acquisition timing information, i.e. what the camera actually
+        quantized the requested settings to. For a Single Scan the kinetic
+        time is the whole frame time -- exposure plus readout plus keep
+        clean -- which is what WaitForAcquisition really blocks for.
+
+        GetReadOutTime / GetKeepCleanTime break that number down further.
+        They only exist in SDK 2.9 and later, so all three are bound
+        defensively below; a missing one leaves its dll* attribute as None
+        rather than failing to load the camera.
+
+        Parameters
+        ----------
+        float* exposure:   valid exposure time in seconds
+        float* accumulate: valid accumulate cycle time in seconds
+        float* kinetic:    valid kinetic cycle time in seconds
+        (GetReadOutTime and GetKeepCleanTime each take a single float*.)
+
+        Return
+        ------
+        unsigned int
+            DRV_SUCCESS             Timing information returned.
+            DRV_NOT_INITIALIZED     System not initialized.
+            DRV_ACQUIRING           Acquisition in progress.
+            DRV_INVALID_MODE        Acquisition or readout mode not available.
+        """
+        for timingName, numArgs in (("GetAcquisitionTimings", 3),
+                                    ("GetReadOutTime", 1),
+                                    ("GetKeepCleanTime", 1)):
+            try:
+                timingFunc = getattr(dll, timingName)
+            except AttributeError:
+                # Purely diagnostic calls, so an old DLL that lacks them
+                # should degrade, not refuse to run the camera.
+                log.debug("DLL has no {}; timing diagnostics reduced".format(
+                    timingName))
+                setattr(self, "dll" + timingName, None)
+                continue
+            timingFunc.restype = c_uint
+            timingFunc.argtypes = [POINTER(c_float)] * numArgs
+            setattr(self, "dll" + timingName, timingFunc)
         
         """
         SetGain: I believe set EMCCDGain is prefered 
