@@ -1,0 +1,15 @@
+# Core GUI stack
+PyQt5
+# Pinned: 0.12+ removed the pyqtgraph.pixmaps subpackage and other internals
+# that InstsAndQt / hsganalysis monkeypatch at import time.
+pyqtgraph==0.11.1
+numpy
+scipy
+matplotlib
+joblib
+
+# Instrument control (GPIB/serial). No NI-VISA backend exists for macOS,
+# but pyvisa-py lets the app start and fall back to fake instruments.
+pyvisa
+pyvisa-py
+pyserial
