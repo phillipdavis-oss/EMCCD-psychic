@@ -49,8 +49,14 @@ Temporary Items
 # dump folder
 .idea/
 
+# macOS venv created by setup_mac.sh
+.venv/
+
 TheLog.log
 
 Settings.txt
 TheCameraLog.log
 TheInstrumentLog.log
+
+# rotated log backups (RotatingFileHandler writes TheLog.log.1 etc.)
+*.log.[0-9]

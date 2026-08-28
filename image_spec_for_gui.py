@@ -9,6 +9,7 @@ Created on Mon Jan 19 14:01:23 2015
 
 import os, errno
 import copy
+import functools
 import json
 import numpy as np
 # what the hell is this?
@@ -349,7 +350,7 @@ def loadImageFile(fname, cls = None):
 class EMCCD_image(object):
     origin_import = '\nWavelength,Signal\nnm,arb. u.'
     
-    def __init__(self, raw_array=[], file_name='', file_no=None, description='', equipment_dict={}):
+    def __init__(self, raw_array=None, file_name='', file_no=None, description='', equipment_dict=None):
         """
         This init is to work with the most basic images with no specialiation
         for HSG or PL or absorbance data.  Feels like we should have something
@@ -371,6 +372,15 @@ class EMCCD_image(object):
                              dark_region (maybe not that useful if can look at y_max + n)
 							 series = name for series
         """
+        # These default to None, not to [] / {}: a mutable default is shared
+        # by every call, and this class writes into equipment_dict below
+        # ("background_file"), so images built without an explicit dict would
+        # otherwise all share one.
+        if raw_array is None:
+            raw_array = []
+        if equipment_dict is None:
+            equipment_dict = {}
+
         self.raw_array = np.array(raw_array)
         self.raw_shape = self.raw_array.shape
         self.file_name = file_name
@@ -414,12 +424,12 @@ class EMCCD_image(object):
         dictionary entry works.  It could get ugly without double checking.
         '''
         if self.clean_array is None:
-            raise Exception('Source: EMCCD_image.__add__\nThe first array has not been cleaned yet')
             log.error("Unable to add: First array not cleaned")
+            raise Exception('Source: EMCCD_image.__add__\nThe first array has not been cleaned yet')
         ret = copy.deepcopy(self)
         
         # Add a constant offset to the data
-        if type(other) in (int, float):
+        if isinstance(other, (int, float, np.integer, np.floating)):
             ret.clean_array = self.clean_array + other
         
         # or add the two clean_arrays together
@@ -450,7 +460,7 @@ class EMCCD_image(object):
             raise Exception('Source: EMCCD_image.__sub__\nThe first array has not been cleaned yet')
         ret = copy.deepcopy(self)
         
-        if type(other) in (int, float):
+        if isinstance(other, (int, float, np.integer, np.floating)):
             ret.clean_array = self.clean_array - other
         else:
             if np.isclose(ret.equipment_dict['center_lambda'], 
@@ -524,14 +534,16 @@ class EMCCD_image(object):
             except:
                 self.spectrum = self.raw_array[self.equipment_dict['y_min']:self.equipment_dict['y_max'],:].sum(axis=0)
             wavelengths = gen_wavelengths(self.equipment_dict['center_lambda'],
-                                          self.equipment_dict['grating'])
-            self.spectrum = np.concatenate((wavelengths, self.spectrum)).reshape(2,1600).T
+                                          self.equipment_dict['grating'],
+                                          self.spectrum.shape[0])
+            self.spectrum = np.vstack((wavelengths, self.spectrum)).T
         else:
             self.spectrum = self.clean_array[self.equipment_dict['y_min']:self.equipment_dict['y_max'],:].sum(axis=0)
             spec_std = np.mean(self.std_array[self.equipment_dict['y_min']:self.equipment_dict['y_max'],:], axis=0)
             wavelengths = gen_wavelengths(self.equipment_dict['center_lambda'],
-                                          self.equipment_dict['grating'])
-            self.spectrum = np.concatenate((wavelengths, self.spectrum, spec_std)).reshape(3,1600).T
+                                          self.equipment_dict['grating'],
+                                          self.spectrum.shape[0])
+            self.spectrum = np.vstack((wavelengths, self.spectrum, spec_std)).T
 
 
         
@@ -806,11 +818,12 @@ class HSG_image(EMCCD_image):
     pass
 
 class HSG_FVB_image(HSG_image):
-    def __init__(self, raw_array=[], file_name='', file_no=None, description='', equipment_dict={}):
+    def __init__(self, raw_array=None, file_name='', file_no=None, description='', equipment_dict=None):
         super(HSG_FVB_image, self).__init__(raw_array, file_name, file_no, description, equipment_dict)
         self.isSeries = False
 
-    def cosmic_ray_removal(self, offset = 0, medianRatio = 1, noiseCoeff = 5):
+    def cosmic_ray_removal(self, offset = 0, medianRatio = 1, noiseCoeff = 5,
+                           debug = False):
         """
         Remove cosmic rays from the raw_array when it is a sequence
         of consecutive exposures.
@@ -819,109 +832,103 @@ class HSG_FVB_image(HSG_image):
         :param medianRatio: Multiplier to the median when deciding a cutoff
         :param noiseCoeff: Multiplier to the noise on the median
                     May need changing for noisy data
+        :param debug: pop up pyqtgraph windows showing the raw image, the
+                    median image and their difference. Off by default -- these
+                    used to be opened unconditionally on every call, which
+                    meant three live GraphicsLayoutWidgets per acquisition.
+                    Matches the `debug` kwarg on
+                    ConsecutiveImageAnalyzer.removeCosmics.
         :return:
         """
-        # log.warn("Warning: HSG FVB Cosmic removal not implemented")
-        # self.clean_array = self.raw_array
-
         d = np.array(self.raw_array)
-        print(d.shape)
 
-        med = ndimage.filters.median_filter(d, size=(d.shape[0], 1), mode='wrap')
-        print(med.shape)
+        med = ndimage.median_filter(d, size=(d.shape[0], 1), mode='wrap')
         meanMedian  = med.mean(axis=0)
-        print(meanMedian.shape)
         # Construct a cutoff for each pixel. It was kind of guess and
         # check
         cutoff = meanMedian * medianRatio + noiseCoeff * np.std(meanMedian[:100])
-        print(cutoff.shape)
 
-
-
-
+        log.debug("CRR shapes: d={}, med={}, meanMedian={}, cutoff={}".format(
+            d.shape, med.shape, meanMedian.shape, cutoff.shape))
 
         winlist = []
+        if debug:
+            win = pg.GraphicsLayoutWidget()
+            win.setWindowTitle("Raw Image")
+            p1 = win.addPlot()
 
-        win = pg.GraphicsLayoutWidget()
-        win.setWindowTitle("Raw Image")
-        p1 = win.addPlot()
+            img = pg.ImageItem()
+            img.setImage(d.copy().T)
+            p1.addItem(img)
 
-        img = pg.ImageItem()
-        img.setImage(d.copy().T)
-        p1.addItem(img)
+            hist = pg.HistogramLUTItem()
+            hist.setImageItem(img)
+            win.addItem(hist)
 
-        hist = pg.HistogramLUTItem()
-        hist.setImageItem(img)
-        win.addItem(hist)
+            win.nextRow()
+            p2 = win.addPlot(colspan=2)
+            p2.plot(np.sum(d, axis=1))
+            win.show()
+            winlist.append(win)
 
-        win.nextRow()
-        p2 = win.addPlot(colspan=2)
-        p2.plot(np.sum(d, axis=1))
-        win.show()
-        winlist.append(win)
+            win2 = pg.GraphicsLayoutWidget()
+            win2.setWindowTitle("Median Image")
+            p1 = win2.addPlot()
 
-        win2 = pg.GraphicsLayoutWidget()
-        win2.setWindowTitle("Median Image")
-        p1 = win2.addPlot()
+            img = pg.ImageItem()
+            img.setImage(med.T)
+            p1.addItem(img)
 
-        img = pg.ImageItem()
-        img.setImage(med.T)
-        p1.addItem(img)
+            hist = pg.HistogramLUTItem()
+            hist.setImageItem(img)
+            win2.addItem(hist)
 
-        hist = pg.HistogramLUTItem()
-        hist.setImageItem(img)
-        win2.addItem(hist)
+            win2.nextRow()
+            p2 = win2.addPlot(colspan=2)
 
-        win2.nextRow()
-        p2 = win2.addPlot(colspan=2)
+            p2.plot(np.sum(med, axis=1)/4)
+            win2.show()
+            winlist.append(win2)
 
-        p2.plot(np.sum(med, axis=1)/4)
-        win2.show()
-        winlist.append(win2)
+            win2 = pg.GraphicsLayoutWidget()
+            win2.setWindowTitle("d-m")
+            p1 = win2.addPlot()
 
+            img = pg.ImageItem()
+            img.setImage((d - med).T)
+            p1.addItem(img)
 
+            hist = pg.HistogramLUTItem()
+            hist.setImageItem(img)
+            win2.addItem(hist)
 
+            win2.nextRow()
+            p2 = win2.addPlot(colspan=2)
 
-        win2 = pg.GraphicsLayoutWidget()
-        win2.setWindowTitle("d-m")
-        p1 = win2.addPlot()
-
-        img = pg.ImageItem()
-        img.setImage((d - med).T)
-        p1.addItem(img)
-
-        hist = pg.HistogramLUTItem()
-        hist.setImageItem(img)
-        win2.addItem(hist)
-
-        win2.nextRow()
-        p2 = win2.addPlot(colspan=2)
-
-        p2.plot((d - med)[0,:], pen='w')
-        p2.plot((d - med)[1,:], pen='g')
-        p2.plot((d - med)[2,:], pen='r')
-        p2.plot((d - med)[3,:], pen='y')
-        p2.plot(cutoff, pen='c')
-        win2.show()
-        winlist.append(win2)
-
-
-
-
-
-
+            p2.plot((d - med)[0,:], pen='w')
+            p2.plot((d - med)[1,:], pen='g')
+            p2.plot((d - med)[2,:], pen='r')
+            p2.plot((d - med)[3,:], pen='y')
+            p2.plot(cutoff, pen='c')
+            win2.show()
+            winlist.append(win2)
 
         self.winlist = winlist
         # Find the bad pixel positions
         # Note the [:, None] - needed to cast the correct shapes
         badPixs = np.argwhere((d - med)>(cutoff))
-        for pix in badPixs:
-            # get the other pixels in the row which aren't the cosmic
-            p = d[pix[0], [i for i in range(d.shape[1]) if not i==pix[1]]]
-            # Replace the cosmic by the average of the others
-            # Could get hairy if more than one cosmic per row.
-            # Maybe when doing many exposures?
-            d[pix[0], pix[1]] = np.mean(p)
+        if badPixs.size:
+            # Replace each cosmic by the mean of the rest of its row. Masking
+            # them all out at once and using nanmean does this in one pass
+            # instead of rebuilding an index list per bad pixel; it also keeps
+            # other cosmics in the same row out of the average, which the old
+            # sequential loop did not (see ConsecutiveImageAnalyzer.
+            # removeCosmics, which already worked this way).
+            rows, cols = badPixs[:,0], badPixs[:,1]
+            masked = d.astype(float)
+            masked[rows, cols] = np.nan
+            rowMeans = np.nanmean(masked, axis=1)
+            d[rows, cols] = rowMeans[rows]
         self.clean_array = np.array(d)
 
 
@@ -935,14 +942,16 @@ class HSG_FVB_image(HSG_image):
         if not self.isSeries:
             self.spectrum = self.clean_array[self.equipment_dict['y_min']:self.equipment_dict['y_max'],:].sum(axis=0)
             wavelengths = gen_wavelengths(self.equipment_dict['center_lambda'],
-                                          self.equipment_dict['grating'])
-            self.spectrum = np.concatenate((wavelengths, self.spectrum)).reshape(2,1600).T
+                                          self.equipment_dict['grating'],
+                                          self.spectrum.shape[0])
+            self.spectrum = np.vstack((wavelengths, self.spectrum)).T
 
         else:
             self.spectrum = self.raw_array.sum(axis=0)
             wavelengths = gen_wavelengths(self.equipment_dict['center_lambda'],
-                                          self.equipment_dict['grating'])
-            self.spectrum = np.concatenate((wavelengths, self.spectrum)).reshape(2,1600).T
+                                          self.equipment_dict['grating'],
+                                          self.spectrum.shape[0])
+            self.spectrum = np.vstack((wavelengths, self.spectrum)).T
 
 
     def isEmpty(self):
@@ -986,7 +995,7 @@ class HSG_FVB_image(HSG_image):
         self.clean_array = None
         pulse = self.equipment_dict["fel_pulses"]
         pulse = 1 if pulse == 0 else pulse
-        self.raw_array = self.spectrum[:,1].reshape((1, 1600))/pulse
+        self.raw_array = self.spectrum[:,1].reshape((1, -1))/pulse
         self.file_no += "seriesed"
         self.equipment_dict["fieldStrength"] = [self.equipment_dict["fieldStrength"]]
         self.equipment_dict["fieldInt"] = [self.equipment_dict["fieldInt"]]
@@ -997,7 +1006,7 @@ class PL_image(EMCCD_image):
 
 class Abs_image(EMCCD_image):
     origin_import = '\nWavelength,Raw Trans\nnm,arb. u.'
-    def __init__(self, raw_array=[], file_name='', file_no=None, description='', equipment_dict={}):
+    def __init__(self, raw_array=None, file_name='', file_no=None, description='', equipment_dict=None):
         super(Abs_image, self).__init__(raw_array, file_name, file_no, description, equipment_dict)
         self.abs_spec = None
     def __eq__(self, other):
@@ -1023,12 +1032,13 @@ class Abs_image(EMCCD_image):
         ret = copy.deepcopy(self)
         abs_spec = -10 * np.log10(self.spectrum[:, 1] / other.spectrum[:, 1])
         wavelengths = gen_wavelengths(self.equipment_dict['center_lambda'],
-                                      self.equipment_dict['grating'])
+                                      self.equipment_dict['grating'],
+                                      self.spectrum.shape[0])
 
         # First is blank
         # other is transmission
-        ret.spectrum = np.concatenate((wavelengths, self.spectrum[:, 1].T,
-                                       other.spectrum[:, 1].T, abs_spec)).reshape(4, 1600).T
+        ret.spectrum = np.vstack((wavelengths, self.spectrum[:, 1],
+                                  other.spectrum[:, 1], abs_spec)).T
         return ret
 
 
@@ -1041,12 +1051,13 @@ class Abs_image(EMCCD_image):
         ret = copy.deepcopy(self)
         abs_spec = -10*np.log10(self.spectrum[:,1] / other.spectrum[:,1])
         wavelengths = gen_wavelengths(self.equipment_dict['center_lambda'],
-                                      self.equipment_dict['grating'])
+                                      self.equipment_dict['grating'],
+                                      self.spectrum.shape[0])
 
         # First is blank
         # other is transmission
-        ret.spectrum = np.concatenate((wavelengths, self.spectrum[:,1].T,
-                                        other.spectrum[:,1].T, abs_spec)).reshape(4,1600).T
+        ret.spectrum = np.vstack((wavelengths, self.spectrum[:,1],
+                                  other.spectrum[:,1], abs_spec)).T
         return ret
 
     def setAsSequence(self):
@@ -1256,12 +1267,28 @@ class Image_Reprocesser(object):
                 origin_header=oh
             )
 
-def gen_wavelengths(center_lambda, grating):
+def gen_wavelengths(center_lambda, grating, npix=1600):
     '''
-    This returns a 1600 element list of wavelengths for each pixel in the EMCCD based on grating and center wavelength
+    Thin wrapper around the (cached) calculation. The result depends only on
+    (center_lambda, grating, npix), all of which change rarely, but
+    make_spectrum() calls this on every frame -- including once per frame in
+    continuous mode -- so the ~20-term trig expression below is memoized.
+    A copy is handed out so callers can't corrupt the cached array.
+    '''
+    output = _gen_wavelengths(center_lambda, grating, npix)
+    return None if output is None else output.copy()
+
+
+@functools.lru_cache(maxsize=32)
+def _gen_wavelengths(center_lambda, grating, npix=1600):
+    '''
+    This returns an npix element list of wavelengths for each pixel in the EMCCD based on grating and center wavelength
     
     grating = which grating, 1 or 2
     center = center wavelength in nanometers
+    npix = number of pixels along the wavelength axis. Defaults to the full
+           1600-pixel chip; pass the real width when binning or using a
+           sub-ROI, or the axis won't line up with the spectrum.
     '''
     b = 0.75 # length of spectrometer, in m
     k = -1.0 # order looking at
@@ -1284,7 +1311,10 @@ def gen_wavelengths(center_lambda, grating):
         return None
     
     center = center_lambda*10**-9
-    wavelength_list = np.arange(-799.0,801.0)
+    # Pixel offsets from the chip centre. Written out this way rather than as
+    # arange(-799., 801.) so it generalises to other widths; for npix=1600 it
+    # produces exactly the same -799..800 the hardcoded version did.
+    wavelength_list = np.arange(npix, dtype=float) - (npix//2 - 1)
     
     output = d*k**(-1)*((-1)*np.cos(delta+gamma+(-1)*np.arccos((-1/4)*(1/np.cos((1/2)*gamma))**2*(2*(np.cos((1/2)*gamma)**4*(2+(-1)*d**(-2)*k**2*center**2+2*np.cos(gamma)))**(1/2)+d**(-1)*k*center*np.sin(gamma)))+np.arctan(b**(-1)*(r*wavelength_list+b*np.cos(delta+gamma))*(1/np.sin(delta+gamma))))+(1+(-1/16)*(1/np.cos((1/2)*gamma))**4*(2*(np.cos((1/2)*gamma)**4*(2+(-1)*d**(-2)*k**2*center**2+2*np.cos(gamma)))**(1/2)+d**(-1)*k*center*np.sin(gamma))**2)**(1/2))   
     

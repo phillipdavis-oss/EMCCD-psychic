@@ -7,20 +7,32 @@ Created on Mon Feb 02 10:17:34 2015
 
 
 from ctypes import *
+import os
 import time
 import numpy as np
 import logging
+import logging.handlers
 log = logging.getLogger("Andor")
 log.setLevel(logging.DEBUG)
-handler1 = logging.StreamHandler()
-handler1.setLevel(logging.WARNING)
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-handler1.setFormatter(formatter)
-log.addHandler(handler1)
-handler2 = logging.FileHandler("TheCameraLog.log")
-handler2.setLevel(logging.DEBUG)
-handler2.setFormatter(formatter)
-log.addHandler(handler2)
+# Guard against re-import: these are module-level side effects, so without
+# this a second import would attach a second copy of every handler and
+# double every line in the log.
+if not log.handlers:
+    handler1 = logging.StreamHandler()
+    handler1.setLevel(logging.WARNING)
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    handler1.setFormatter(formatter)
+    log.addHandler(handler1)
+    # Rotating, not plain FileHandler: this logger runs at DEBUG and
+    # fakeAndor logs every single DLL call, so an append-only file grew
+    # without bound. Path is anchored to this module because the Andor SDK
+    # load below chdir()s.
+    handler2 = logging.handlers.RotatingFileHandler(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "TheCameraLog.log"),
+        maxBytes=2*1024*1024, backupCount=3)
+    handler2.setLevel(logging.DEBUG)
+    handler2.setFormatter(formatter)
+    log.addHandler(handler2)
 
 
 class AndorCapabilities(Structure):
@@ -313,14 +325,11 @@ class AndorEMCCD(object):
             self.cameraSettings['gain'] = val
         return ret
 
-    def getImage(self):
+    def _getImageDims(self):
         """
-        :return: array of image value
-
-        This function will automatically read the image from the CCD and
-        then return a numpy array of the correct shape
+        :return: (x, y) pixel dimensions of the image for the current
+        imageSettings/read mode.
         """
-
         # the image settings, for readability
         image = self.cameraSettings["imageSettings"]
 
@@ -342,6 +351,31 @@ class AndorEMCCD(object):
         #     print "Debugging: Non-standard binning"
         #     print image
         #     print x,y
+        return x, y
+
+    def estimateReadoutTime(self):
+        """
+        :return: rough estimate, in seconds, of how long the camera will
+        spend reading out a frame at the currently configured HSS/VSS
+        speeds (both stored in cameraSettings as microseconds), or None
+        if those speeds aren't known yet (e.g. fake camera, not yet set).
+        """
+        hss = self.cameraSettings['curHSS']
+        vss = self.cameraSettings['curVSS']
+        if hss is None or vss is None:
+            return None
+        x, y = self._getImageDims()
+        return (y * vss + x * y * hss) / 1e6
+
+    def getImage(self):
+        """
+        :return: array of image value
+
+        This function will automatically read the image from the CCD and
+        then return a numpy array of the correct shape
+        """
+
+        x, y = self._getImageDims()
 
         retdata = (c_int * (x * y))(-1)
 
@@ -351,15 +385,15 @@ class AndorEMCCD(object):
 
 
 
-        retnums = []
-        for i in range(x*y):
-            retnums.append(retdata[i])
+        # Pull the ctypes buffer straight into numpy instead of appending
+        # x*y (640,000 for a full frame) elements one at a time in Python.
+        # as_array() is a zero-copy view onto retdata; .astype(int) makes an
+        # owned int64 copy, matching what the old list-based path produced and
+        # decoupling the result from the lifetime of the ctypes buffer.
+        retnums = np.ctypeslib.as_array(retdata).reshape(y, x).astype(int)
 
-
-
-        # Rehsape the data. There's also some concern of how exactly the array is returned in relation to
-        # a full image.
-        retnums = np.reshape(retnums, (y, x))
+        # There's also some concern of how exactly the array is returned in
+        # relation to a full image.
         retnums = np.fliplr(retnums)
 
 
@@ -406,14 +440,16 @@ class AndorEMCCD(object):
             try:
                 dll = CDLL(name) #Change this to the appropriate name
             except:
+                curdir = os.getcwd()
                 try:
-                    import os
-                    curdir = os.getcwd()
+                    # The SDK dir has to be the cwd for the DLL's own
+                    # dependencies to resolve. Restore the cwd in a finally,
+                    # not on each branch -- anything writing a relative path
+                    # (e.g. Settings.txt) while we're chdir'd would otherwise
+                    # land in the SDK directory.
                     os.chdir(r'C:\Program Files\Andor SDK')
                     dll = CDLL(name)
-                    os.chdir(curdir)
                 except:
-                    os.chdir(curdir)
                     log.error('Error loading the DLL. Using fake')
                     # from fakeAndor import fAndorEMCCD
                     import fakeAndor as FA
@@ -421,6 +457,8 @@ class AndorEMCCD(object):
                     self.amFake = True
                     dll.Initialize.retWeights = ((1,), -2)
                     dll.Initialize = FA.myCallable(lambda x: None, 'InitializeMissingDLL')
+                finally:
+                    os.chdir(curdir)
         
         self.dll = dll # For if it's ever needed to call things directly
         """

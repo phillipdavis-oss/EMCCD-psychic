@@ -4,6 +4,14 @@ Created on Sat Feb 14 15:06:30 2015
 
 @author: Home
 """
+# pyqtgraph==0.11.1 (pinned in requirements.txt for other compat reasons)
+# still uses np.float/np.int, which NumPy removed in 1.24+. Restore the
+# aliases before pyqtgraph (or anything importing it) runs.
+import numpy as np
+for _npAlias, _builtin in (("float", float), ("int", int), ("bool", bool)):
+    if not hasattr(np, _npAlias):
+        setattr(np, _npAlias, _builtin)
+
 from Andor import AndorEMCCD
 from PyQt5.QtWidgets import *
 import pyqtgraph.console as pgc
@@ -11,11 +19,19 @@ from InstsAndQt.Instruments import *
 from InstsAndQt.PyroOscope.OscWid import OscWid
 from InstsAndQt.customQt import *
 import os
+import time
 try:
     QString = unicode
 except NameError:
     # Python 3
     QString = str
+
+# Anchor the settings file to this module rather than to the cwd. Andor's
+# registerFunctions() chdir()s into the SDK directory while loading the DLL,
+# and the launchers don't guarantee a cwd, so a bare 'Settings.txt' could be
+# written to or read from somewhere unexpected.
+SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             'Settings.txt')
 
 pg.setConfigOption('background', 'w')
 pg.setConfigOption('foreground', 'k')
@@ -25,6 +41,7 @@ except:
     log.critical('GPIB VISA library not installed')
     raise
 import logging
+import logging.handlers
 
 # Disable errors on warnings (done in hsganalysis for tracking down issues)
 import warnings
@@ -34,15 +51,21 @@ warnings.filterwarnings("default")
 
 log = logging.getLogger("EMCCD")
 log.setLevel(logging.DEBUG)
-handler = logging.FileHandler("TheLog.log")
-handler.setLevel(logging.DEBUG)
-handler1 = logging.StreamHandler()
-handler1.setLevel(logging.DEBUG)
-formatter = logging.Formatter('%(asctime)s - [%(filename)s:%(lineno)s - %(funcName)s] - %(levelname)s - %(message)s')
-handler.setFormatter(formatter)
-handler1.setFormatter(formatter)
-log.addHandler(handler)
-log.addHandler(handler1)
+# See the note in Andor.py: guard against re-import duplicating handlers,
+# rotate the file so a DEBUG-level append-only log can't grow without bound,
+# and anchor the path so a chdir() can't relocate it.
+if not log.handlers:
+    handler = logging.handlers.RotatingFileHandler(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "TheLog.log"),
+        maxBytes=2*1024*1024, backupCount=3)
+    handler.setLevel(logging.DEBUG)
+    handler1 = logging.StreamHandler()
+    handler1.setLevel(logging.DEBUG)
+    formatter = logging.Formatter('%(asctime)s - [%(filename)s:%(lineno)s - %(funcName)s] - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+    handler1.setFormatter(formatter)
+    log.addHandler(handler)
+    log.addHandler(handler1)
 
 log.debug("-"*15)
 log.debug("Starting New Session")
@@ -50,7 +73,7 @@ log.debug("-"*15)
 
 # http://stackoverflow.com/questions/1551605/how-to-set-applications-taskbar-icon-in-windows-7/1552105#1552105
 import ctypes
-if os.name is not "posix":
+if os.name != "posix":
     myappid = 'mycompany.myproduct.subproduct.version' # arbitrary string
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
 
@@ -299,7 +322,12 @@ class CCDWindow(QtGui.QMainWindow):
             log.debug("Trying to get resourcemanager")
             rm = visa.ResourceManager()
             log.debug("RM gotten")
-            ar = [i.encode('ascii') for i in rm.list_resources()]
+            # NB: do NOT .encode() these. Under Python 2 str.encode('ascii')
+            # gave back a str; under Python 3 it gives bytes, so every
+            # .index('GPIB0::5::INSTR') below raised ValueError and silently
+            # fell through to the Fake instrument -- and the combo box showed
+            # b'GPIB0::5::INSTR'. pyvisa already hands back str.
+            ar = [str(i) for i in rm.list_resources()]
             log.debug("Got resources list")
             ar.append('Fake')
             s['GPIBlist'] = ar
@@ -389,7 +417,10 @@ class CCDWindow(QtGui.QMainWindow):
         ## TODO:REMOVE
         s["seriesNo"] = 0 # How many series have been summed together?
 
-        s["saveDir"] = r'Z:\~HSG\Data\2018' # Directory for saving
+        # Directory for saving. The year was hardcoded to 2018; derive it so a
+        # fresh install doesn't default into a stale directory. (Only the
+        # default -- a saveDir restored from Settings.txt still wins.)
+        s["saveDir"] = time.strftime(r'Z:\~HSG\Data\%Y')
 
         # For Hunter. First time you set a temp, it will
         # pop up and make sure you turned on the chiller
@@ -456,6 +487,17 @@ class CCDWindow(QtGui.QMainWindow):
         log.debug("Initializing UI")
         self.ui = Ui_MainWindow()
         self.ui.setupUi(self)
+
+        # On macOS, Qt auto-assigns a native menu role to QActions based on
+        # their text (e.g. anything with "Settings"/"Preferences" gets pulled
+        # into the app menu as Preferences, anything with "Exit"/"Quit" gets
+        # pulled out as Quit) as soon as the native menu bar syncs, which can
+        # happen as early as setupUi(). Setting NoRole on the actions
+        # afterward isn't reliably able to undo that relocation, so instead
+        # disable the native/unified menu bar for this window on macOS,
+        # forcing every item to render in-window like on Windows. This is a
+        # no-op on Windows, which has no native unified menu bar to disable.
+        self.menuBar().setNativeMenuBar(False)
 
         # I don't want some of the buttons in the Acquisition mode to be clickable, because they're not
         # valid settings. But I want them there so that I can just call the <combobox>.currentindex() wihtout
@@ -1292,7 +1334,7 @@ class CCDWindow(QtGui.QMainWindow):
     def addRotationStage(self):
         try:
             from InstsAndQt.ThorlabsCageRotator.K10CR1Panel import K10CR1Panel
-        except ImportError:
+        except Exception:
             MessageDialog(self, "Error importing module for K10CR1")
             return
 
@@ -1848,7 +1890,7 @@ class CCDWindow(QtGui.QMainWindow):
         # saveDict['comments'] = str(self.getCurExp().ui.tCCDComments.toPlainText())
 
         # print "saving curvss", saveDict["curVSS"]
-        with open('Settings.txt', 'w') as fh:
+        with open(SETTINGS_FILE, 'w') as fh:
             json.dump(saveDict, fh, separators=(',', ': '),
                       sort_keys=True, indent=4, default=lambda x: 'NotSerial')
 
@@ -1859,10 +1901,10 @@ class CCDWindow(QtGui.QMainWindow):
         and if it's recent enough that it should be loaded
         :return:
         """
-        if not os.path.isfile('Settings.txt'):
+        if not os.path.isfile(SETTINGS_FILE):
             # File doesn't exist
             return False
-        if (time.time() - os.path.getmtime('Settings.txt')) > 30 * 60:
+        if (time.time() - os.path.getmtime(SETTINGS_FILE)) > 30 * 60:
             # It's been longer than 30 minutes and likely isn't worth
             # keeping open
             return False
@@ -1892,7 +1934,7 @@ class CCDWindow(QtGui.QMainWindow):
         :return:
         """
 
-        with open('Settings.txt') as fh:
+        with open(SETTINGS_FILE) as fh:
             savedDict = json.load(fh)
         self.settings.update({k:v for k,v in list(savedDict.items()) if k in self.settings})
 
@@ -1963,7 +2005,11 @@ class CCDWindow(QtGui.QMainWindow):
         :return:
         """
         tagDict = dict()
-        tagDict["SPECL"] = str(self.Spectrometer.getWavelength())
+        # Read from the UI's cached value rather than querying the
+        # spectrometer live: genEquipmentDict() does the same for
+        # center_lambda, and it avoids a hard crash here when no
+        # spectrometer is connected (self.Spectrometer is None).
+        tagDict["SPECL"] = str(self.ui.sbSpecWavelength.value())
         tagDict["SPECSTEP"] = str(self.getCurExp().ui.tSpectrumStep)
         img = self.CCD.cameraSettings["imageSettings"]
 
@@ -2070,6 +2116,9 @@ class CCDWindow(QtGui.QMainWindow):
             if self.getCurExp().thDoExposure.isRunning():
                 log.info("Waiting for image collection to finish")
                 self.sigUpdateStatusBar.emit("Please wait for exposure to complete")
+                # QCloseEvent is accepted by default, so without this the
+                # window closed anyway and tore the app down mid-exposure.
+                event.ignore()
                 return
 
         except:
@@ -2121,7 +2170,7 @@ class CCDWindow(QtGui.QMainWindow):
         # Make sure the shutter isn't accidentally left open
         # 0,0 -> Auto
         self.CCD.setShutterEx(0, 0)
-        if self.ui.tabWidget.indexOf(self.oscWidget) is not -1:
+        if self.ui.tabWidget.indexOf(self.oscWidget) != -1:
             self.oscWidget.close()
         if not fastExit:
             ret = self.CCD.dllCoolerOFF()

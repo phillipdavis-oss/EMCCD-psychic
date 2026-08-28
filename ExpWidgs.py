@@ -146,6 +146,7 @@ class BaseExpWidget(QtWidgets.QWidget):
         self.runSettings = dict() # For keeping various information during the run
         self.runSettings["seriesNo"] = 0
         self.runSettings["exposing"] = False
+        self.runSettings["reading"] = False
 
         self.crrSettings={
             "ratio":0.07,
@@ -442,6 +443,7 @@ class BaseExpWidget(QtWidgets.QWidget):
         """
 
         self.runSettings["progress"] = 0
+        self.runSettings["reading"] = False
 
         if not self.papa.ui.mFileTakeContinuous.isChecked():
             # don't spam the log
@@ -507,11 +509,14 @@ class BaseExpWidget(QtWidgets.QWidget):
         if self.papa.CCD.cameraSettings["exposureTime"]<=1:
             return
 
+        self.runSettings["reading"] = False
+        self.runSettings["phaseDurationMs"] = self.papa.CCD.cameraSettings["exposureTime"]*1000
+
         self.papa.updateElementSig.emit(self.ui.lCCDProg, "Waiting exposure")
         self.exposureElapsedTimer.start()
 
         self.progressTimer.timeout.connect(self.updateProgressBar)
-        self.progressTimer.setInterval(self.papa.CCD.cameraSettings["exposureTime"]*10)
+        self.progressTimer.setInterval(self.runSettings["phaseDurationMs"]/100)
         self.progressTimer.setSingleShot(True)
         self.progressTimer.start()
 
@@ -539,6 +544,7 @@ class BaseExpWidget(QtWidgets.QWidget):
         # 100 and not change the text
         if not self.runSettings["exposing"]:
             self.runSettings["progress"] = 100
+            self.runSettings["reading"] = False
             self.papa.updateElementSig.emit(self.ui.lCCDProg, "Reading Data")
             self.ui.pCCD.setValue(self.runSettings["progress"])
             return
@@ -548,7 +554,7 @@ class BaseExpWidget(QtWidgets.QWidget):
             self.ui.pCCD.setValue(self.runSettings["progress"])
             # Get the new time, correcting for lags and other things
             # which deviate from expected.
-            newTime = ((self.runSettings["progress"] + 1) * self.papa.CCD.cameraSettings["exposureTime"]*10) \
+            newTime = ((self.runSettings["progress"] + 1) * self.runSettings["phaseDurationMs"]/100) \
                       - (self.exposureElapsedTimer.elapsed())
 
             # Sometimes things take so long, it wants us to go back in time,
@@ -562,9 +568,33 @@ class BaseExpWidget(QtWidgets.QWidget):
                 self.progressTimer.start()
             except:
                 log.critical("Didn't update progress ")
+        elif not self.runSettings["reading"]:
+            # The naive "Waiting exposure" countdown (sized only to the
+            # configured exposure time) has run out, but the hardware
+            # ('exposing') isn't actually done -- it's still in the real
+            # sensor readout, whose duration depends on HSS/VSS and can be
+            # much longer than the exposure itself. Switch to a second,
+            # readout-time-estimate-driven phase instead of just freezing
+            # on a static label for an unknown amount of time.
+            self.runSettings["reading"] = True
+            estimate = self.papa.CCD.estimateReadoutTime()
+            if estimate:
+                self.runSettings["progress"] = 0
+                self.runSettings["phaseDurationMs"] = estimate*1000
+                self.exposureElapsedTimer.start()
+                self.papa.updateElementSig.emit(
+                    self.ui.lCCDProg, "Reading Data (~{:.1f}s)".format(estimate))
+                self.ui.pCCD.setValue(0)
+                self.progressTimer.setInterval(self.runSettings["phaseDurationMs"]/100)
+                self.progressTimer.timeout.connect(self.updateProgressBar)
+                self.progressTimer.start()
+            else:
+                self.papa.updateElementSig.emit(self.ui.lCCDProg, "Reading Data")
+                self.exposureElapsedTimer = None
         else:
+            # The estimated readout time has also elapsed, but the hardware
+            # still isn't done. Just hold here until it actually finishes.
             self.papa.updateElementSig.emit(self.ui.lCCDProg, "Reading Data")
-            self.runSettings["exposing"] = False
             self.exposureElapsedTimer = None
 
     def startContinuous(self, value):
@@ -605,31 +635,57 @@ class BaseExpWidget(QtWidgets.QWidget):
             # that data collection would normally be performed on
             self.takeImage(isBackground = self.takeContinuousLoop)
 
+    def calcLiveSpectrum(self, rawData):
+        """
+        Vertically bin rawData over the current ROI and pair it with the
+        wavelength axis -- i.e. what EMCCD_image.make_spectrum() produces, but
+        without constructing an image object. Used by the continuous/alignment
+        loop, which throws the result away as soon as it has been drawn.
+
+        Reads only the four values make_spectrum actually needs. They're
+        re-read every pass because the ROI can be dragged while aligning.
+
+        :return: (npix, 2) array of [wavelength, counts]
+        """
+        raw = np.asarray(rawData)
+        yMin = int(self.ui.tCCDYMin.text())
+        yMax = int(self.ui.tCCDYMax.text())
+        spectrum = raw[yMin:yMax, :].sum(axis=0)
+        wavelengths = gen_wavelengths(
+            float(self.papa.ui.sbSpecWavelength.value()),
+            int(self.papa.ui.sbSpecGrating.value()),
+            spectrum.shape[0])
+        return np.vstack((wavelengths, spectrum)).T
+
     def takeContinuousLoop(self):
         while self.papa.ui.mFileTakeContinuous.isChecked():
             self.doExposure()
             # Update from the image that was taken in the first call
             # when starting the loop
             self.sigUpdateGraphs.emit(self.updateSignalImage, self.rawData)
-            # create the object and clean it up
-            image = EMCCD_image(self.rawData,
-                                "", "", "", self.genEquipmentDict())
-            # Ignore CRR and just set the clean to raw for summing
-            image.clean_array = image.raw_array
-            image.make_spectrum()
-            self.sigUpdateGraphs.emit(self.updateSpectrum, image.spectrum)
+            # Only the summed spectrum is needed to draw the live view, so
+            # don't build a whole EMCCD_image per frame: that cost an extra
+            # copy of the raw array, a fresh ConsecutiveImageAnalyzer, and a
+            # full genEquipmentDict() sweep (dozens of widget reads, plus
+            # getExposureResults() in FEL mode) on every displayed frame.
+            self.sigUpdateGraphs.emit(self.updateSpectrum,
+                                      self.calcLiveSpectrum(self.rawData))
             # self.doExposure()
+
+        # This method runs on thDoExposure, so everything below has to be
+        # marshalled onto the GUI thread rather than called inline --
+        # AlignWid.takeContinuousLoop already does it this way.
         # re-enable UI elements, remove alignment plots
-        self.toggleUIElements(True)
-        self.ui.gCCDImage.view.removeItem(self.ilOnep1)
-        self.ui.gCCDImage.view.removeItem(self.ilTwop1)
-        self.ui.gCCDBin.plotItem.removeItem(self.ilOnep2)
-        self.ui.gCCDBin.plotItem.removeItem(self.ilTwop2)
+        self.sigMakeGui.emit(self.ui.gCCDImage.view.removeItem, (self.ilOnep1,))
+        self.sigMakeGui.emit(self.ui.gCCDImage.view.removeItem, (self.ilTwop1,))
+        self.sigMakeGui.emit(self.ui.gCCDBin.plotItem.removeItem, (self.ilOnep2,))
+        self.sigMakeGui.emit(self.ui.gCCDBin.plotItem.removeItem, (self.ilTwop2,))
 
         # re-enable the other tabs
         for i in range(self.papa.ui.tabWidget.count()):
             if i == self.papa.ui.tabWidget.indexOf(self.papa.getCurExp()): continue
-            self.papa.ui.tabWidget.setTabEnabled(i, True)
+            self.sigMakeGui.emit(self.papa.ui.tabWidget.setTabEnabled, (i, True))
+        self.sigMakeGui.emit(self.toggleUIElements, (True,))
         self.runSettings["takingContinuous"] = False
 
 
@@ -814,7 +870,13 @@ class BaseExpWidget(QtWidgets.QWidget):
         :return:
         """
         s = dict()
-        s["date"] = time.strftime('%x %X%p')
+        # ISO 8601 local time. The old '%x %X%p' gave e.g. '08/27/26 14:14:56PM'
+        # -- two-digit year, locale-dependent field order, and a bogus PM
+        # stuck on a 24-hour clock -- which is ambiguous in every saved file.
+        # NB: this string goes into the JSON header of every image/spectrum,
+        # so any downstream reader that parses "date" needs to expect the new
+        # format (older archived files keep the old one).
+        s["date"] = time.strftime('%Y-%m-%dT%H:%M:%S')
         s["ccd_temperature"] = str(self.papa.ui.tSettingsCurrTemp.text())
         s["exposure"] = float(self.papa.CCD.cameraSettings["exposureTime"])
         s["gain"] = int(self.papa.CCD.cameraSettings["gain"])
@@ -1440,11 +1502,9 @@ class BaseExpWidget(QtWidgets.QWidget):
 
         # Set right axis to display real pixel coordinates
         start=self.papa.CCD.cameraSettings["imageSettings"][4] #vstart
-        stop=self.papa.CCD.cameraSettings["imageSettings"][5]  # vstop
         step=self.papa.CCD.cameraSettings["imageSettings"][1]
-        realPix = np.arange(start=start,
-                            stop=stop,
-                            step=step)
+        # (there used to be an np.arange(start, vstop, step) here; nothing ever
+        # read it -- the axis is driven entirely by the lambda below.)
 
         self.ui.gCCDImage.getView().getAxis('right').setDataSet(
             lambda pix: pix*step + start
@@ -1802,6 +1862,13 @@ class AbsWid(BaseExpWidget):
         self.curRefEMCCD = None
         self.prevRefEMCCD = None
         self.curAbsEMCCD = None # holds the actual absorption
+        # True while an absorbance pair (blank + transmission) is on the plot.
+        # BaseExpWidget.processImage() re-emits a bare image spectrum after we've
+        # already drawn that pair, and without this the raw emit lands in the
+        # catch-all branch of updateSpectrum() and overwrites the blank curve
+        # with the image -- so both raw curves ended up showing the image and
+        # the reference was never visible.
+        self._absOnPlot = False
         self.low_pass_cutoff = 1.8
 
     def initUI(self):
@@ -1838,6 +1905,7 @@ class AbsWid(BaseExpWidget):
         self.takeImage(isBackground = self.processReference)
 
     def processImage(self):
+        self._absOnPlot = False
         self.curDataEMCCD = self.DataClass(self.rawData,
                                            str(self.papa.ui.tImageName.text()),
                                            str(self.ui.tCCDImageNum.value()+1),
@@ -1853,8 +1921,13 @@ class AbsWid(BaseExpWidget):
                 self.curDataEMCCD = self.curDataEMCCD-self.curBackEMCCD
                 self.curDataEMCCD.make_spectrum()
                 self.curAbsEMCCD = self.curDataEMCCD/self.curRefEMCCD
+                # Set before emitting: super().processImage() below emits the
+                # raw image spectrum, and this tells updateSpectrum() to leave
+                # the pair we just drew alone.
+                self._absOnPlot = True
                 self.sigUpdateGraphs.emit(self.updateSpectrum, self.curAbsEMCCD)
             except Exception as e:
+                self._absOnPlot = False
                 log.warning("Error updating abs spectrum {}".format(e))
         super(AbsWid, self).processImage()
 
@@ -1920,6 +1993,7 @@ class AbsWid(BaseExpWidget):
         self.sigUpdateGraphs.emit(self.updateSignalImage, self.prevRefEMCCD.imageSequence.getImages())
 
     def processImageSequence(self):
+        self._absOnPlot = False
         super(AbsWid, self).processImageSequence()
         if self.curRefEMCCD is None or not self.curRefEMCCD==self.curDataEMCCD:
             self.papa.sigUpdateStatusBar.emit("Please take a reference with the same settings")
@@ -1935,6 +2009,7 @@ class AbsWid(BaseExpWidget):
             except Exception as e:
                 self.papa.sigUpdateStatusBar.emit("Error saving Absorbance")
                 log.warning("Error saving Absorbance Spectrum, {}".format(e))
+            self._absOnPlot = True
             self.sigUpdateGraphs.emit(self.updateSpectrum, self.curAbsEMCCD)
 
     def processReference(self):
@@ -2224,6 +2299,7 @@ class AbsWid(BaseExpWidget):
             data = self.curAbsEMCCD.spectrum # for updating pixel axis on top of graph
         elif id(data)==id(self.curRefEMCCD):
             title = "Blank"
+            self._absOnPlot = False
             data = self.curRefEMCCD.spectrum
             self.pRawBlank.setData(data[:,0], data[:,1])
             self.pSpec.setData([], [])
@@ -2234,12 +2310,16 @@ class AbsWid(BaseExpWidget):
                 )
                 self.ui.gCCDBin.plotItem.vb.enableAutoRange(x=True)
         else:
-            self.pRawTrans.setData(data[:,0], data[:,1])
-            if self.ui.gCCDBin.plotItem.vb.state["autoRange"][0]:
-                self.ui.gCCDBin.plotItem.setRange(
-                    xRange=data[[0,-1],0]
-                )
-                self.ui.gCCDBin.plotItem.vb.enableAutoRange(x=True)
+            # A bare spectrum array, i.e. an image with no usable reference.
+            # If an absorbance pair is already displayed this is the base
+            # class's raw re-emit; drawing it would hide the blank.
+            if not self._absOnPlot:
+                self.pRawTrans.setData(data[:,0], data[:,1])
+                if self.ui.gCCDBin.plotItem.vb.state["autoRange"][0]:
+                    self.ui.gCCDBin.plotItem.setRange(
+                        xRange=data[[0,-1],0]
+                    )
+                    self.ui.gCCDBin.plotItem.vb.enableAutoRange(x=True)
             self.updateGraphViews()
 
         # set top axis to pixel number

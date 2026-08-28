@@ -117,8 +117,8 @@ class fAndorEMCCD(object):
             cosmicLocy = np.random.randint(0,1600, size=(5,))
             cosmicMask[cosmicLocx, cosmicLocy] = np.random.randint(20000, 60000, size=(5,))
 
-            a = sps.gaussian(5, 1)[None,:]
-            b = sps.gaussian(25, 5)[:,None]
+            a = sps.windows.gaussian(5, 1)[None,:]
+            b = sps.windows.gaussian(25, 5)[:,None]
             sbKernal = a*b
             # space 50px apart
             sbMask = np.zeros_like(bg)

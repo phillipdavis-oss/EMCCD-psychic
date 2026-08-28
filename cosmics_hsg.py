@@ -112,7 +112,7 @@ class cosmicsimage:
         """
         self.rawarray = rawarray + pssl # internally, we will always work "with sky".
         self.cleanarray = self.rawarray.copy() # In lacosmiciteration() we work on this guy
-        self.mask = np.cast['bool'](np.zeros(self.rawarray.shape)) # All False, no cosmics yet
+        self.mask = np.zeros(self.rawarray.shape, dtype=bool) # All False, no cosmics yet
         
         self.gain = gain
         self.readnoise = readnoise
@@ -221,19 +221,19 @@ class cosmicsimage:
         # This is a list of the indices of cosmic affected pixels.
         #print cosmicindices
         
-        # We put cosmic ray pixels to np.Inf to flag them :
-        self.cleanarray[mask] = np.Inf
+        # We put cosmic ray pixels to np.inf to flag them :
+        self.cleanarray[mask] = np.inf
         
         # Now we want to have a 2 pixel frame of Inf padding around our image.
         w = self.cleanarray.shape[0]
         h = self.cleanarray.shape[1]
-        padarray = np.zeros((w+4,h+4))+np.Inf
+        padarray = np.zeros((w+4,h+4))+np.inf
         padarray[2:w+2,2:h+2] = self.cleanarray.copy() # that copy is important, we need 2 independent arrays
         
-        # The medians will be evaluated in this padarray, skipping the np.Inf.
-        # Now in this copy called padarray, we also put the saturated stars to np.Inf, if available :
+        # The medians will be evaluated in this padarray, skipping the np.inf.
+        # Now in this copy called padarray, we also put the saturated stars to np.inf, if available :
         if self.satstars is not None:
-            padarray[2:w+2,2:h+2][self.satstars] = np.Inf
+            padarray[2:w+2,2:h+2][self.satstars] = np.inf
             # Viva python, I tested this one, it works...
         
         # A loop through every cosmic pixel :
@@ -242,14 +242,14 @@ class cosmicsimage:
             y = cosmicpos[1]
             cutout = padarray[x:x+5, y:y+5].ravel() # remember the shift due to the padding !
             #print cutout
-            # Now we have our 25 pixels, some of them are np.Inf, and we want to take the median
-            goodcutout = cutout[cutout != np.Inf]
-            #print np.alen(goodcutout)
+            # Now we have our 25 pixels, some of them are np.inf, and we want to take the median
+            goodcutout = cutout[cutout != np.inf]
+            #print len(goodcutout)
             
-            if np.alen(goodcutout) >= 25 :
+            if len(goodcutout) >= 25 :
                 # This never happened, but you never know ...
                 raise RuntimeError("Mega error in clean !")
-            elif np.alen(goodcutout) > 0 :
+            elif len(goodcutout) > 0 :
                 replacementvalue = np.median(goodcutout)
             else :    
                 # i.e. no good pixels : Shit, a huge cosmic, we will have to improvise ...
@@ -314,19 +314,19 @@ class cosmicsimage:
         # This is a list of the indices of cosmic affected pixels.
         #print cosmicindices
         
-        # We put cosmic ray pixels to np.Inf to flag them :
-        self.cleanarray[mask] = np.Inf
+        # We put cosmic ray pixels to np.inf to flag them :
+        self.cleanarray[mask] = np.inf
         
         # Now we want to have a 2 pixel frame of Inf padding around our image.
         w = self.cleanarray.shape[0]
         h = self.cleanarray.shape[1]
-        padarray = np.zeros((w,h+24))+np.Inf
+        padarray = np.zeros((w,h+24))+np.inf
         padarray[:, 12:h+12] = self.cleanarray.copy() # that copy is important, we need 2 independent arrays
         
-        # The medians will be evaluated in this padarray, skipping the np.Inf.
-        # Now in this copy called padarray, we also put the saturated stars to np.Inf, if available :
+        # The medians will be evaluated in this padarray, skipping the np.inf.
+        # Now in this copy called padarray, we also put the saturated stars to np.inf, if available :
         if self.satstars is not None:
-            padarray[2:w+2,2:h+2][self.satstars] = np.Inf
+            padarray[2:w+2,2:h+2][self.satstars] = np.inf
             # Viva python, I tested this one, it works...
         
         # A loop through every cosmic pixel :
@@ -335,14 +335,14 @@ class cosmicsimage:
             y = cosmicpos[1]
             cutout = padarray[x:x+1, y:y+25].ravel() # remember the shift due to the padding !
             #print cutout
-            # Now we have our 25 pixels, some of them are np.Inf, and we want to take the median
-            goodcutout = cutout[cutout != np.Inf]
-            #print np.alen(goodcutout)
+            # Now we have our 25 pixels, some of them are np.inf, and we want to take the median
+            goodcutout = cutout[cutout != np.inf]
+            #print len(goodcutout)
             
-            if np.alen(goodcutout) >= 25 :
+            if len(goodcutout) >= 25 :
                 # This never happened, but you never know ...
                 raise RuntimeError("Mega error in clean !")
-            elif np.alen(goodcutout) > 0 :
+            elif len(goodcutout) > 0 :
                 replacementvalue = np.median(goodcutout)
             else :    
                 # i.e. no good pixels : Shit, a huge cosmic, we will have to improvise ...
@@ -395,7 +395,7 @@ class cosmicsimage:
         satpixels = self.rawarray > self.satlevel # the candidate pixels
         
         # We build a smoothed version of the image to look for large stars and their support :
-        m5 = ndimage.filters.median_filter(self.rawarray, size=5, mode='mirror')
+        m5 = ndimage.median_filter(self.rawarray, size=5, mode='mirror')
         # We look where this is above half the satlevel
         largestruct = m5 > (self.satlevel/2.0)
         # The rough locations of saturated stars are now :
@@ -432,7 +432,7 @@ class cosmicsimage:
             if np.sum(overlap) > 0:
                 outmask = np.logical_or(outmask, thisisland) # we add thisisland to the mask
             
-        self.satstars = np.cast['bool'](outmask)
+        self.satstars = np.asarray(outmask, dtype=bool)
         
         if verbose:
                 print("Mask of saturated stars done")
@@ -511,7 +511,7 @@ class cosmicsimage:
             print("Creating noise model ...")
             
         # We build a custom noise map, so to compare the laplacian to
-        m5 = ndimage.filters.median_filter(self.cleanarray, size=5, mode='mirror')
+        m5 = ndimage.median_filter(self.cleanarray, size=5, mode='mirror')
         # We keep this m5, as I will use it later for the interpolation.
         m5clipped = m5.clip(min=0.00001) # As we will take the sqrt
         noise = (1.0/self.gain) * np.sqrt(self.gain*m5clipped + self.readnoise*self.readnoise)
@@ -524,7 +524,7 @@ class cosmicsimage:
         # This s is called sigmap in the original lacosmic.cl
         
         # We remove the large structures (s prime) :
-        sp = s - ndimage.filters.median_filter(s, size=5, mode='mirror')
+        sp = s - ndimage.median_filter(s, size=5, mode='mirror')
          
         if verbose:
             print("Selecting candidate cosmic rays ...")
@@ -550,8 +550,8 @@ class cosmicsimage:
             print("Building fine structure image ...")
         
         # We build the fine structure image :
-        m3 = ndimage.filters.median_filter(self.cleanarray, size=3, mode='mirror')
-        m37 = ndimage.filters.median_filter(m3, size=7, mode='mirror')
+        m3 = ndimage.median_filter(self.cleanarray, size=3, mode='mirror')
+        m37 = ndimage.median_filter(m3, size=7, mode='mirror')
         f = m3 - m37
         # In the article that's it, but in lacosmic.cl f is divided by the noise...
         # Ok I understand why, it depends on if you use sp/f or L+/f as criterion.
@@ -631,7 +631,7 @@ class cosmicsimage:
         if verbose :
             print "Finding holes ..."
 
-        m3 = ndimage.filters.median_filter(self.cleanarray, size=3, mode='mirror')
+        m3 = ndimage.median_filter(self.cleanarray, size=3, mode='mirror')
         h = (m3 - self.cleanarray).clip(min=0.0)
         
         tofits("h.fits", h)
@@ -649,7 +649,7 @@ class cosmicsimage:
         
         tofits("lplus.fits", lplus)
         
-        m5 = ndimage.filters.median_filter(self.cleanarray, size=5, mode='mirror')
+        m5 = ndimage.median_filter(self.cleanarray, size=5, mode='mirror')
         m5clipped = m5.clip(min=0.00001)
         noise = (1.0/self.gain) * np.sqrt(self.gain*m5clipped + self.readnoise*self.readnoise)
 
@@ -657,7 +657,7 @@ class cosmicsimage:
         # This s is called sigmap in the original lacosmic.cl
         
         # We remove the large structures (s prime) :
-        sp = s - ndimage.filters.median_filter(s, size=5, mode='mirror')
+        sp = s - ndimage.median_filter(s, size=5, mode='mirror')
          
         holes = sp > self.sigclip    
         """
@@ -758,7 +758,7 @@ def tofits(outfilename, pixelarray, hdr = None, verbose = True):
         print("FITS export shape : (%i, %i)" % (pixelarrayshape[0], pixelarrayshape[1]))
 
     if pixelarray.dtype.name == "bool":
-        pixelarray = np.cast["uint8"](pixelarray)
+        pixelarray = pixelarray.astype(np.uint8)
 
     if os.path.isfile(outfilename):
         os.remove(outfilename)
@@ -815,14 +815,20 @@ def rebin(a, newshape):
     
     shape = a.shape
     lenShape = len(shape)
-    factor = np.asarray(shape)/np.asarray(newshape)
-    #print factor
-    evList = ['a.reshape('] + \
-            ['newshape[%d],factor[%d],'%(i,i) for i in range(lenShape)] + \
-            [')'] + ['.sum(%d)'%(i+1) for i in range(lenShape)] + \
-            ['/factor[%d]'%i for i in range(lenShape)]
+    # Both of these must be integers: reshape() won't accept floats, and under
+    # Python 3 a plain / gives floats even for evenly dividing ints.
+    newshape = tuple(int(i) for i in newshape)
+    factor = tuple(s // n for s, n in zip(shape, newshape))
 
-    return eval(''.join(evList))
+    # Split every axis into (bin index, index within bin), then average over
+    # the within-bin axes -- the odd-numbered ones. This used to be assembled
+    # as a string and eval()'d, which turned any bad input into an opaque error.
+    splitShape = []
+    for n, f in zip(newshape, factor):
+        splitShape += [n, f]
+    binned = a.reshape(splitShape).sum(axis=tuple(range(1, 2*lenShape, 2)))
+
+    return binned / np.prod(factor)
 
 
 def rebin2x2(a):
@@ -833,5 +839,5 @@ def rebin2x2(a):
     if not (inshape % 2 == np.zeros(2)).all(): # Modulo check to see if size is even
         raise RuntimeError("I want even image shapes !")
         
-    return rebin(a, inshape/2)
+    return rebin(a, inshape//2)
 
