@@ -2208,8 +2208,13 @@ class CCDWindow(QtGui.QMainWindow):
         del self.CCD.dll
         del self.CCD
 
+        # NOTE: don't call self.close() here. QWidget.close() re-enters
+        # closeEvent() synchronously (before this call returns), and by
+        # this point self.CCD has just been deleted above, so the
+        # re-entrant call crashes with an unhandled AttributeError at
+        # `temp = self.CCD.getTemperature()` a few lines up. event.accept()
+        # is all that's needed for Qt to actually close the window.
         event.accept()
-        self.close()
 
 class ScanParameterDialog(QtGui.QDialog):
     def __init__(self, parent=None):
