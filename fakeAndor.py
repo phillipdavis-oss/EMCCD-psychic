@@ -7,6 +7,7 @@ Created on Sat Feb 14 19:00:33 2015
 
 import numpy as np
 import time
+import threading
 import logging
 import scipy.signal as sps
 log = logging.getLogger("Andor")
@@ -58,8 +59,9 @@ class myCallable(object):
 class fAndorEMCCD(object):
     _image = [1, 1, 1, 400, 1, 1600]
     def __init__(self):
+        self._waitCancelEvent = threading.Event()
         self.AbortAcquisition = myCallable(self.__voidReturn, 'AbortAcquisition')
-        self.CancelWait = myCallable(self.__voidReturn, 'CancelWait')
+        self.CancelWait = myCallable(self.__cancelWait, 'CancelWait')
         self.CoolerON = myCallable(self.__voidReturn, 'CoolerON')
         self.CoolerOFF = myCallable(self.__voidReturn, 'CoolerOFF')
         self.GetAcquiredData = myCallable(self.__getData, 'GetAcquiredData')
@@ -157,12 +159,18 @@ class fAndorEMCCD(object):
         x = args[0][-1]
         x.value = np.random.randint(3, 5)
     def __cancelWait(self, *args):
-        self.WaitForAcquisition.retWeights = ((1,), (20024,))
+        self._waitCancelEvent.set()
     def __wait(self, *args):
-        # Wait a random amount of time to simulate it
-        self.WaitForAcquisition.retWeights = ((1,), (20002,))
+        # Wait a random amount of time to simulate it, but wake up early
+        # if __cancelWait sets the event (simulates the real CancelWait()
+        # DLL call unblocking a thread sleeping in WaitForAcquisition)
+        self._waitCancelEvent.clear()
         print("Sleeping for: {}".format(self.exposure))
-        time.sleep(self.exposure)
+        cancelled = self._waitCancelEvent.wait(timeout=self.exposure)
+        if cancelled:
+            self.WaitForAcquisition.retWeights = ((1,), (20024,))
+        else:
+            self.WaitForAcquisition.retWeights = ((1,), (20002,))
 
     def __setExp(self, val):
         self.exposure = val[0]

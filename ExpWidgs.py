@@ -147,6 +147,7 @@ class BaseExpWidget(QtWidgets.QWidget):
         self.runSettings["seriesNo"] = 0
         self.runSettings["exposing"] = False
         self.runSettings["reading"] = False
+        self.runSettings["exposureGen"] = 0
 
         self.crrSettings={
             "ratio":0.07,
@@ -155,6 +156,14 @@ class BaseExpWidget(QtWidgets.QWidget):
 
 
         self.exposureElapsedTimer = QtCore.QElapsedTimer() # For keeping the progress bar correct
+
+        # Watchdog for a "Reading Data" state that never resolves. Only acts
+        # when the trigger mode is External, since that's the one case where
+        # the camera itself (not just slow readout) can block forever --
+        # waiting on a trigger pulse that never arrives.
+        self.stuckReadTimer = QtCore.QTimer()
+        self.stuckReadTimer.setSingleShot(True)
+        self.stuckReadTimer.timeout.connect(self.onStuckReadTimeout)
 
         self.thDoExposure = TempThread()
         self.thUpdateProg = TempThread()
@@ -444,6 +453,7 @@ class BaseExpWidget(QtWidgets.QWidget):
 
         self.runSettings["progress"] = 0
         self.runSettings["reading"] = False
+        self.runSettings["exposureGen"] += 1
 
         if not self.papa.ui.mFileTakeContinuous.isChecked():
             # don't spam the log
@@ -500,6 +510,8 @@ class BaseExpWidget(QtWidgets.QWidget):
     def abortAcquisition(self):
         ret = self.papa.CCD.dllAbortAcquisition()
         log.debug("Abort acq return val: {}".format(ret))
+        ret = self.papa.CCD.dllCancelWait()
+        log.debug("Cancel wait return val: {}".format(ret))
 
     def startProgressBar(self):
         # things are breaking if the exposure time is too short
@@ -591,11 +603,34 @@ class BaseExpWidget(QtWidgets.QWidget):
             else:
                 self.papa.updateElementSig.emit(self.ui.lCCDProg, "Reading Data")
                 self.exposureElapsedTimer = None
+                self.armStuckReadWatchdog()
         else:
             # The estimated readout time has also elapsed, but the hardware
             # still isn't done. Just hold here until it actually finishes.
             self.papa.updateElementSig.emit(self.ui.lCCDProg, "Reading Data")
             self.exposureElapsedTimer = None
+            self.armStuckReadWatchdog()
+
+    def armStuckReadWatchdog(self):
+        # gen is captured so a watchdog armed for one exposure can never
+        # act on a later, unrelated one (e.g. user aborts and retries
+        # within the timeout window).
+        self.stuckReadGen = self.runSettings["exposureGen"]
+        self.stuckReadTimer.start(60000)
+
+    def onStuckReadTimeout(self):
+        if self.runSettings["exposureGen"] != self.stuckReadGen:
+            return
+        if not self.runSettings["exposing"]:
+            return
+        if self.papa.CCD.cameraSettings.get("curTrig") != "External":
+            return
+        log.warning("Acquisition stuck in Reading Data for 60s on external "
+                    "trigger; aborting")
+        self.abortAcquisition()
+        MessageDialog(self, "Acquisition timed out after 60s -- stuck "
+                      "waiting for ext trigger. The acquisition was "
+                      "aborted; check that the trigger source is running.")
 
     def startContinuous(self, value):
         # If not value, the box was being unchecked,

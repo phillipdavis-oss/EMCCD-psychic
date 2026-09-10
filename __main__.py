@@ -669,7 +669,7 @@ class CCDWindow(QtGui.QMainWindow):
         # self.ui.mFileBreakTemp.triggered.connect(lambda: self.setTempThread.terminate())
         self.ui.mFileTakeContinuous.triggered[bool].connect(lambda v: self.getCurExp().startContinuous(v))
         self.ui.mFileEnableAll.triggered[bool].connect(self.toggleExtraSettings)
-        self.ui.mFIleAbortAcquisition.triggered.connect(lambda v: self.getCurExp().abortAcquisition())
+        self.ui.mFIleAbortAcquisition.triggered.connect(lambda v: self.abortCurrentAcquisition())
 
         ##
         # todo: follow through the removal of undo series
@@ -897,6 +897,13 @@ class CCDWindow(QtGui.QMainWindow):
         # but that corresponds to the curExp at that time,
         # not at all times
         return self.curExp
+
+    def abortCurrentAcquisition(self):
+        curExp = self.getCurExp()
+        if curExp is None:
+            log.info("Abort Acquisition clicked with no experiment open; ignoring.")
+            return
+        curExp.abortAcquisition()
 
     @staticmethod
     def ____________ES(): pass
@@ -2129,6 +2136,15 @@ class CCDWindow(QtGui.QMainWindow):
             if self.setTempThread.isRunning():
                 log.info("Please wait for detector to warm")
                 self.sigUpdateStatusBar.emit("Please wait for camera temp to set")
+                event.ignore()
+                return
+        except:
+            pass
+
+        try:
+            if self.thDoSpectrometerSweep.isRunning():
+                log.info("Waiting for spectrometer sweep to finish")
+                self.sigUpdateStatusBar.emit("Please wait for the current sweep to complete")
                 event.ignore()
                 return
         except:
