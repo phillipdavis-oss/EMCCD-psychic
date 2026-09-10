@@ -2134,10 +2134,24 @@ class CCDWindow(QtGui.QMainWindow):
         # if the detector is cooled, need to warm it back up
         try:
             if self.setTempThread.isRunning():
-                log.info("Please wait for detector to warm")
-                self.sigUpdateStatusBar.emit("Please wait for camera temp to set")
-                event.ignore()
-                return
+                if fastExit:
+                    # Fast exit is the "restart software right now" escape
+                    # hatch, so don't block it on a temp-set thread -- kill
+                    # it the same way the Break Temp Loop action does, and
+                    # wait for it to actually stop before we go on to tear
+                    # down the CCD/DLL object below.
+                    log.warning("Fast exit: terminating in-progress temperature set")
+                    try:
+                        self.setTempThread.finished.disconnect(self.cleanupSetTemp)
+                    except Exception:
+                        pass
+                    self.setTempThread.terminate()
+                    self.setTempThread.wait()
+                else:
+                    log.info("Please wait for detector to warm")
+                    self.sigUpdateStatusBar.emit("Please wait for camera temp to set")
+                    event.ignore()
+                    return
         except:
             pass
 
