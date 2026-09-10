@@ -58,6 +58,7 @@ class myCallable(object):
 
 class fAndorEMCCD(object):
     _image = [1, 1, 1, 400, 1, 1600]
+    exposure = 0.5
     def __init__(self):
         self._waitCancelEvent = threading.Event()
         self.AbortAcquisition = myCallable(self.__voidReturn, 'AbortAcquisition')
@@ -65,13 +66,16 @@ class fAndorEMCCD(object):
         self.CoolerON = myCallable(self.__voidReturn, 'CoolerON')
         self.CoolerOFF = myCallable(self.__voidReturn, 'CoolerOFF')
         self.GetAcquiredData = myCallable(self.__getData, 'GetAcquiredData')
+        self.GetAcquisitionTimings = myCallable(self.__getTimings, 'GetAcquisitionTimings')
         self.GetCapabilities = myCallable(self.__voidReturn, 'GetCapabilities')
         self.GetDetector = myCallable(self.__getDet, 'GetDetector')
         self.GetHSSpeed = myCallable(self.__getHSS, 'GetHSSpeed')
+        self.GetKeepCleanTime = myCallable(self.__getKeepClean, 'GetKeepCleanTime')
         self.GetMostRecentImage = myCallable(self.__voidReturn, 'GetMostRecentImage')
         self.GetNumberADChannels = myCallable(self.__getNum, 'GetNumberADChannels')
         self.GetNumberHSSpeeds = myCallable(self.__getNum, 'GetNumberHSSpeeds')
         self.GetNumberVSSpeeds = myCallable(self.__getNum, 'GetNumberVSSpeeds')
+        self.GetReadOutTime = myCallable(self.__getReadout, 'GetReadOutTime')
         self.GetStatus = myCallable(self.__getNum, 'GetStatus')
         self.GetTemperature = myCallable(self.__getNum, 'GetTemperature', ((1, 20), (20036, 20037)))
         self.GetVSSpeed = myCallable(self.__getHSS, 'GetVSSpeed')
@@ -158,6 +162,25 @@ class fAndorEMCCD(object):
     def __getNum(self, *args):
         x = args[0][-1]
         x.value = np.random.randint(3, 5)
+
+    def __readoutTime(self):
+        """Pretend to read the chip out at 1 MHz, so the fake camera's
+        timings scale with the ROI/binning the way a real one's do."""
+        hbin, vbin, hstart, hend, vst, ven = tuple(self._image)
+        return ((hend - hstart + 1) // hbin) * ((ven - vst + 1) // vbin) * 1e-6
+
+    def __getTimings(self, *args):
+        exposure, accumulate, kinetic = args[0]
+        exposure.value = self.exposure
+        accumulate.value = self.exposure + self.__readoutTime()
+        kinetic.value = accumulate.value
+
+    def __getReadout(self, *args):
+        args[0][-1].value = self.__readoutTime()
+
+    def __getKeepClean(self, *args):
+        args[0][-1].value = 1e-3
+
     def __cancelWait(self, *args):
         self._waitCancelEvent.set()
     def __wait(self, *args):
