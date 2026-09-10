@@ -61,6 +61,7 @@ class fAndorEMCCD(object):
     exposure = 0.5
     def __init__(self):
         self._waitCancelEvent = threading.Event()
+        self._acquiring = False
         self.AbortAcquisition = myCallable(self.__voidReturn, 'AbortAcquisition')
         self.CancelWait = myCallable(self.__cancelWait, 'CancelWait')
         self.CoolerON = myCallable(self.__voidReturn, 'CoolerON')
@@ -76,7 +77,7 @@ class fAndorEMCCD(object):
         self.GetNumberHSSpeeds = myCallable(self.__getNum, 'GetNumberHSSpeeds')
         self.GetNumberVSSpeeds = myCallable(self.__getNum, 'GetNumberVSSpeeds')
         self.GetReadOutTime = myCallable(self.__getReadout, 'GetReadOutTime')
-        self.GetStatus = myCallable(self.__getNum, 'GetStatus')
+        self.GetStatus = myCallable(self.__getStatus, 'GetStatus')
         self.GetTemperature = myCallable(self.__getNum, 'GetTemperature', ((1, 20), (20036, 20037)))
         self.GetVSSpeed = myCallable(self.__getHSS, 'GetVSSpeed')
         self.Initialize = myCallable(self.__voidReturn, 'Initialize', ((1, ), (-1,)))
@@ -181,6 +182,12 @@ class fAndorEMCCD(object):
     def __getKeepClean(self, *args):
         args[0][-1].value = 1e-3
 
+    def __getStatus(self, *args):
+        # Mirrors real DRV_ACQUIRING (20072) / DRV_IDLE (20073), tracked by
+        # whether __wait is currently blocked, so the fake camera's status
+        # log lines in abortAcquisition() are realistic instead of random.
+        args[0][-1].value = 20072 if self._acquiring else 20073
+
     def __cancelWait(self, *args):
         self._waitCancelEvent.set()
     def __wait(self, *args):
@@ -188,8 +195,12 @@ class fAndorEMCCD(object):
         # if __cancelWait sets the event (simulates the real CancelWait()
         # DLL call unblocking a thread sleeping in WaitForAcquisition)
         self._waitCancelEvent.clear()
+        self._acquiring = True
         print("Sleeping for: {}".format(self.exposure))
-        cancelled = self._waitCancelEvent.wait(timeout=self.exposure)
+        try:
+            cancelled = self._waitCancelEvent.wait(timeout=self.exposure)
+        finally:
+            self._acquiring = False
         if cancelled:
             self.WaitForAcquisition.retWeights = ((1,), (20024,))
         else:

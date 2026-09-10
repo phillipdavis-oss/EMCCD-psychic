@@ -156,6 +156,11 @@ class AndorEMCCD(object):
         self.temperature = temp.value
         return self.temperature
 
+    def getStatus(self):
+        status = c_int(0)
+        self.dllGetStatus(status)
+        return status.value
+
     def initialize(self, ad = 0, outputAmp = 0):
         
         # get detector size

@@ -541,10 +541,38 @@ class BaseExpWidget(QtWidgets.QWidget):
         postProcessing()
 
     def abortAcquisition(self):
+        # Purely diagnostic -- logged, not branched on. If the rare
+        # readout-time crash/lag recurs, this gives real evidence of what
+        # the camera's status was doing instead of guessing.
+        log.debug("Camera status before abort: {}".format(
+            self.papa.CCD.parseRetCode(self.papa.CCD.getStatus())))
+
         ret = self.papa.CCD.dllAbortAcquisition()
         log.debug("Abort acq return val: {}".format(ret))
         ret = self.papa.CCD.dllCancelWait()
         log.debug("Cancel wait return val: {}".format(ret))
+
+        log.debug("Camera status after abort: {}".format(
+            self.papa.CCD.parseRetCode(self.papa.CCD.getStatus())))
+
+        # Abort/CancelWait only affect a thread actually blocked in
+        # WaitForAcquisition(). If the exposure thread is still running a
+        # moment after those calls, it isn't blocked there any more -- it's
+        # stuck somewhere past the camera call (e.g. cosmic ray removal or
+        # another "Cleaning Data" step), which Abort/CancelWait can't reach.
+        # Kill it directly so Abort actually works as an escape hatch there
+        # too. Safe to do: the save-to-disk step happens after "Cleaning
+        # Data", so this can't leave a partially-written file, only skip
+        # the save for this one image.
+        tStart = time.time()
+        while self.thDoExposure.isRunning() and time.time() - tStart < 1:
+            time.sleep(0.05)
+        if self.thDoExposure.isRunning():
+            log.warning("Exposure thread still running 1s after abort/cancel; "
+                        "terminating it (stuck past the camera call)")
+            self.thDoExposure.terminate()
+            self.thDoExposure.wait()
+            self.sigMakeGui.emit(self.toggleUIElements, (True,))
 
     def startProgressBar(self):
         # A short exposure used to skip the progress bar entirely, on the
